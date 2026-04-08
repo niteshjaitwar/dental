@@ -1,0 +1,25 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="markBlue" x1="18" y1="16" x2="74" y2="110" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#63D7FF"/>
+      <stop offset="1" stop-color="#0A61C9"/>
+    </linearGradient>
+    <linearGradient id="markGold" x1="58" y1="22" x2="95" y2="96" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE680"/>
+      <stop offset="1" stop-color="#D39A00"/>
+    </linearGradient>
+    <linearGradient id="markCross" x1="75" y1="62" x2="111" y2="98" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#16A34A"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="white"/>
+  <path d="M18 97L28 25H47L71 61L78 25H98L88 97H68L44 60L37 97H18Z" fill="url(#markBlue)"/>
+  <path d="M61 25H108L103 40H88L81 97H61L68 40H54L61 25Z" fill="url(#markGold)"/>
+  <path d="M10 84C32 54 58 43 90 46" stroke="#27C4F4" stroke-width="5" stroke-linecap="round" opacity="0.78"/>
+  <path d="M16 92C44 107 83 106 112 83" stroke="#FFB703" stroke-width="4" stroke-linecap="round" opacity="0.82"/>
+  <g transform="translate(72 62)">
+    <rect x="10" width="12" height="42" rx="4" fill="url(#markCross)"/>
+    <rect y="15" width="32" height="12" rx="4" fill="url(#markCross)"/>
+  </g>
+</svg>
