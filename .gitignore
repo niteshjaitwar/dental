@@ -4,6 +4,7 @@
 # next.js
 /.next
 /out
+/coverage
 
 # production
 /build
@@ -26,3 +27,6 @@ pnpm-debug.log*
 
 # typescript
 *.tsbuildinfo
+
+# local persisted submissions
+.data/

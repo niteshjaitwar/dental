@@ -11,7 +11,19 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts"],
     coverage: {
+      include: [
+        "lib/booking.ts",
+        "lib/validations.ts",
+        "lib/server/**/*.ts",
+      ],
+      exclude: ["lib/server/logger.ts"],
       reporter: ["text", "lcov"],
+      thresholds: {
+        lines: 80,
+        functions: 80,
+        branches: 75,
+        statements: 80,
+      },
     },
   },
 });

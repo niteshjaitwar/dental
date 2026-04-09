@@ -20,4 +20,13 @@ describe("getAvailableSlots", () => {
     expect(first).not.toEqual(second);
     expect(first).not.toEqual(third);
   });
+
+  it("removes reserved slots from availability", () => {
+    const date = new Date("2026-04-08");
+    const initial = getAvailableSlots(date, "dr-amelia");
+    const reserved = initial.slice(0, 2);
+    const filtered = getAvailableSlots(date, "dr-amelia", reserved);
+
+    expect(filtered).toEqual(initial.filter((slot) => !reserved.includes(slot)));
+  });
 });

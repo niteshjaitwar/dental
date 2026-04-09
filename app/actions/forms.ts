@@ -1,8 +1,17 @@
 "use server";
 
+import { randomUUID } from "node:crypto";
 import { getAvailableSlots } from "@/lib/booking";
 import { clinicConfig } from "@/lib/config";
 import { emptyActionState, type ActionState } from "@/lib/form-state";
+import { enqueueDeliveryJob, processDeliveryJob } from "@/lib/server/delivery-queue";
+import { logInfo, logWarn } from "@/lib/server/logger";
+import { checkRateLimit } from "@/lib/server/request-guard";
+import {
+  createBookingRecord,
+  createEnquiryRecord,
+  getReservedSlots,
+} from "@/lib/server/submissions-store";
 import {
   bookingSchema,
   chatbotSchema,
@@ -31,34 +40,31 @@ function getString(formData: FormData, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-async function postToWebhook(
-  endpoint: string | undefined,
-  payload: Record<string, unknown>,
-): Promise<boolean> {
-  if (!endpoint) {
-    return false;
-  }
-
-  try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      cache: "no-store",
-    });
-
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
 export async function submitBookingAction(
   _previousState: ActionState<BookingValues>,
   formData: FormData,
 ): Promise<ActionState<BookingValues>> {
+  const requestId = randomUUID();
+
+  if (getString(formData, "website")) {
+    logWarn("booking honeypot triggered", { requestId });
+
+    return {
+      status: "success",
+      message: clinicConfig.booking.successDescription,
+      fieldErrors: {},
+      payload: {
+        doctorId: "",
+        date: "",
+        patientName: "",
+        email: "",
+        phone: "",
+        reason: "",
+        slot: "",
+      },
+    };
+  }
+
   const values: BookingValues = {
     doctorId: getString(formData, "doctorId"),
     date: getString(formData, "date"),
@@ -80,9 +86,32 @@ export async function submitBookingAction(
     };
   }
 
-  const availableSlots = getAvailableSlots(
-    new Date(parsed.data.date),
+  const bookingRateLimit = await checkRateLimit(
+    `booking:${parsed.data.email}:${parsed.data.phone}`,
+    {
+      limit: 3,
+      windowMs: 60_000,
+    },
+  );
+
+  if (bookingRateLimit.limited) {
+    return {
+      status: "error",
+      message: `Too many booking attempts. Please wait ${Math.ceil(bookingRateLimit.retryAfterMs / 1000)} seconds and try again.`,
+      fieldErrors: {},
+      values,
+    };
+  }
+
+  const reservedSlots = await getReservedSlots(
+    parsed.data.date,
     parsed.data.doctorId,
+  );
+
+  const availableSlots = getAvailableSlots(
+    new Date(`${parsed.data.date}T00:00:00`),
+    parsed.data.doctorId,
+    reservedSlots,
   );
 
   if (!availableSlots.includes(parsed.data.slot)) {
@@ -97,35 +126,96 @@ export async function submitBookingAction(
     };
   }
 
-  const forwarded = await postToWebhook(process.env.BOOKING_WEBHOOK_URL, {
-    type: "booking",
-    clinic: clinicConfig.brand.clinicName,
-    submittedAt: new Date().toISOString(),
-    ...parsed.data,
-  });
+  const record = await createBookingRecord(parsed.data, requestId);
 
-  if (!forwarded && !process.env.BOOKING_WEBHOOK_URL) {
+  if (!record.ok) {
     return {
       status: "error",
       message:
-        "Booking workflow is not configured yet. Add BOOKING_WEBHOOK_URL before going live.",
-      fieldErrors: {},
+        "That slot was just taken by another patient. Please choose another time.",
+      fieldErrors: {
+        slot: "Choose one of the currently available slots",
+      },
       values,
     };
   }
 
-  if (!forwarded) {
+  const deliveryJob = await enqueueDeliveryJob({
+    topic: "booking",
+    recordId: record.booking.id,
+    requestId,
+    endpoint: process.env.BOOKING_WEBHOOK_URL,
+    payload: {
+      type: "booking",
+      clinic: clinicConfig.brand.clinicName,
+      submittedAt: new Date().toISOString(),
+      requestId,
+      bookingId: record.booking.id,
+      confirmationCode: record.booking.confirmationCode,
+      ...parsed.data,
+    },
+  });
+
+  const delivery = await processDeliveryJob(deliveryJob.id);
+
+  if (delivery?.status === "failed" || delivery?.status === "dead_letter") {
+    logWarn("booking delivery failed after persistence", {
+      requestId,
+      bookingId: record.booking.id,
+      confirmationCode: record.booking.confirmationCode,
+      error: delivery.lastError,
+      statusCode: delivery.lastStatusCode,
+    });
+
     return {
-      status: "error",
-      message: "We could not forward the booking request. Please try again.",
+      status: "success",
+      message: `Your request was saved with reference ${record.booking.confirmationCode}. Our team will review it manually because automatic confirmation is temporarily unavailable.`,
       fieldErrors: {},
-      values,
+      payload: {
+        doctorId: "",
+        date: "",
+        patientName: "",
+        email: "",
+        phone: "",
+        reason: "",
+        slot: "",
+      },
     };
   }
+
+  if (delivery?.status === "skipped") {
+    logWarn("booking saved without outbound webhook", {
+      requestId,
+      bookingId: record.booking.id,
+      confirmationCode: record.booking.confirmationCode,
+    });
+
+    return {
+      status: "success",
+      message: `Your booking request was saved with reference ${record.booking.confirmationCode}. Connect BOOKING_WEBHOOK_URL before relying on automated clinic workflows.`,
+      fieldErrors: {},
+      payload: {
+        doctorId: "",
+        date: "",
+        patientName: "",
+        email: "",
+        phone: "",
+        reason: "",
+        slot: "",
+      },
+    };
+  }
+
+  logInfo("booking saved and delivered", {
+    requestId,
+    bookingId: record.booking.id,
+    confirmationCode: record.booking.confirmationCode,
+    deliveryJobId: deliveryJob.id,
+  });
 
   return {
     status: "success",
-    message: clinicConfig.booking.successDescription,
+    message: `${clinicConfig.booking.successDescription} Reference: ${record.booking.confirmationCode}.`,
     fieldErrors: {},
     payload: {
       doctorId: "",
@@ -143,6 +233,25 @@ export async function submitEnquiryAction(
   _previousState: ActionState<EnquiryValues>,
   formData: FormData,
 ): Promise<ActionState<EnquiryValues>> {
+  const requestId = randomUUID();
+
+  if (getString(formData, "website")) {
+    logWarn("enquiry honeypot triggered", { requestId });
+
+    return {
+      status: "success",
+      message: clinicConfig.contactForm.successDescription,
+      fieldErrors: {},
+      payload: {
+        name: "",
+        phone: "",
+        email: "",
+        service: "",
+        message: "",
+      },
+    };
+  }
+
   const values: EnquiryValues = {
     name: getString(formData, "name"),
     phone: getString(formData, "phone"),
@@ -162,31 +271,91 @@ export async function submitEnquiryAction(
     };
   }
 
-  const forwarded = await postToWebhook(process.env.CONTACT_WEBHOOK_URL, {
-    type: "enquiry",
-    clinic: clinicConfig.brand.clinicName,
-    submittedAt: new Date().toISOString(),
-    ...parsed.data,
+  const enquiryRateLimit = await checkRateLimit(
+    `enquiry:${parsed.data.email}:${parsed.data.phone}`,
+    {
+      limit: 4,
+      windowMs: 60_000,
+    },
+  );
+
+  if (enquiryRateLimit.limited) {
+    return {
+      status: "error",
+      message: `Too many enquiry attempts. Please wait ${Math.ceil(enquiryRateLimit.retryAfterMs / 1000)} seconds and try again.`,
+      fieldErrors: {},
+      values,
+    };
+  }
+
+  const enquiry = await createEnquiryRecord(parsed.data, requestId);
+
+  const deliveryJob = await enqueueDeliveryJob({
+    topic: "enquiry",
+    recordId: enquiry.id,
+    requestId,
+    endpoint: process.env.CONTACT_WEBHOOK_URL,
+    payload: {
+      type: "enquiry",
+      clinic: clinicConfig.brand.clinicName,
+      submittedAt: new Date().toISOString(),
+      requestId,
+      enquiryId: enquiry.id,
+      ...parsed.data,
+    },
   });
 
-  if (!forwarded && !process.env.CONTACT_WEBHOOK_URL) {
+  const delivery = await processDeliveryJob(deliveryJob.id);
+
+  if (delivery?.status === "failed" || delivery?.status === "dead_letter") {
+    logWarn("enquiry delivery failed after persistence", {
+      requestId,
+      enquiryId: enquiry.id,
+      error: delivery.lastError,
+      statusCode: delivery.lastStatusCode,
+    });
+
     return {
-      status: "error",
+      status: "success",
       message:
-        "Enquiry workflow is not configured yet. Add CONTACT_WEBHOOK_URL before going live.",
+        "Your enquiry was saved for manual follow-up because automatic routing is temporarily unavailable.",
       fieldErrors: {},
-      values,
+      payload: {
+        name: "",
+        phone: "",
+        email: "",
+        service: "",
+        message: "",
+      },
     };
   }
 
-  if (!forwarded) {
+  if (delivery?.status === "skipped") {
+    logWarn("enquiry saved without outbound webhook", {
+      requestId,
+      enquiryId: enquiry.id,
+    });
+
     return {
-      status: "error",
-      message: "We could not forward the enquiry. Please try again.",
+      status: "success",
+      message:
+        "Your enquiry was saved. Connect CONTACT_WEBHOOK_URL before relying on automated routing.",
       fieldErrors: {},
-      values,
+      payload: {
+        name: "",
+        phone: "",
+        email: "",
+        service: "",
+        message: "",
+      },
     };
   }
+
+  logInfo("enquiry saved and delivered", {
+    requestId,
+    enquiryId: enquiry.id,
+    deliveryJobId: deliveryJob.id,
+  });
 
   return {
     status: "success",
@@ -276,7 +445,15 @@ export async function requestChatbotReplyAction(
         };
       } else {
         const isoDate = parsed.data.message;
-        const slots = getAvailableSlots(bookingDate, activeDraft.doctorId);
+        const reservedSlots = await getReservedSlots(
+          isoDate,
+          activeDraft.doctorId,
+        );
+        const slots = getAvailableSlots(
+          bookingDate,
+          activeDraft.doctorId,
+          reservedSlots,
+        );
 
         payload = {
           reply: `Available slots on ${isoDate} are ${slots.slice(0, 5).join(", ")}. Use the booking page to submit the request securely.`,
